@@ -87,6 +87,27 @@ class DropoutHiddenLayer(HiddenLayer):
 
         self.output = _dropout_from_layer(rng, self.output, p=dropout_rate)
 
+def _bobakout_from_layer(rng, layer, temperature):
+    """p is the probablity of dropping a unit
+    """
+    srng = theano.tensor.shared_randomstreams.RandomStreams(
+            rng.randint(999999))
+    p = T.nnet.sigmoid(layer / temperature)
+    mask = srng.uniform(size=layer.shape) < p
+    # The cast is important because
+    # int * float32 = float64 which pulls things off the gpu
+    output = layer * T.cast(mask, theano.config.floatX)
+    return output
+
+class BobakoutHiddenLayer(HiddenLayer):
+    def __init__(self, rng, input, n_in, n_out,
+                 activation, temperature, use_bias, W=None, b=None):
+        super(BobakoutHiddenLayer, self).__init__(
+                rng=rng, input=input, n_in=n_in, n_out=n_out, W=W, b=b,
+                activation=activation, use_bias=use_bias)
+
+        self.output = _bobakout_from_layer(rng, self.output, temperature)
+
 
 class MLP(object):
     """A multilayer perceptron with all the trappings required to do dropout
@@ -97,7 +118,7 @@ class MLP(object):
             rng,
             input,
             layer_sizes,
-            dropout_rates,
+            temperature,
             activations,
             use_bias=True):
 
@@ -110,14 +131,17 @@ class MLP(object):
         next_layer_input = input
         #first_layer = True
         # dropout the input
-        next_dropout_layer_input = _dropout_from_layer(rng, input, p=dropout_rates[0])
+        #next_dropout_layer_input = _bobakout_from_layer(rng, input, temperature)
+        next_dropout_layer_input = input
         layer_counter = 0        
         for n_in, n_out in weight_matrix_sizes[:-1]:
-            next_dropout_layer = DropoutHiddenLayer(rng=rng,
+            #next_dropout_layer = DropoutHiddenLayer(rng=rng,
+            next_dropout_layer = BobakoutHiddenLayer(rng=rng,
                     input=next_dropout_layer_input,
-                    activation=activations[layer_counter],
+                    # activation=activations[layer_counter],
+                    activation=None,
                     n_in=n_in, n_out=n_out, use_bias=use_bias,
-                    dropout_rate=dropout_rates[layer_counter])
+                    temperature=temperature)
             self.dropout_layers.append(next_dropout_layer)
             next_dropout_layer_input = next_dropout_layer.output
 
@@ -127,7 +151,7 @@ class MLP(object):
                     input=next_layer_input,
                     activation=activations[layer_counter],
                     # scale the weight matrix W with (1-p)
-                    W=next_dropout_layer.W * (1 - dropout_rates[layer_counter]),
+                    W=next_dropout_layer.W,
                     b=next_dropout_layer.b,
                     n_in=n_in, n_out=n_out,
                     use_bias=use_bias)
@@ -147,7 +171,7 @@ class MLP(object):
         output_layer = LogisticRegression(
             input=next_layer_input,
             # scale the weight matrix W with (1-p)
-            W=dropout_output_layer.W * (1 - dropout_rates[-1]),
+            W=dropout_output_layer.W,
             b=dropout_output_layer.b,
             n_in=n_in, n_out=n_out)
         self.layers.append(output_layer)
@@ -173,7 +197,6 @@ def test_mlp(
         mom_params,
         activations,
         dropout,
-        dropout_rates,
         results_file_name,
         layer_sizes,
         dataset,
@@ -189,7 +212,6 @@ def test_mlp(
 
 
     """
-    assert len(layer_sizes) - 1 == len(dropout_rates)
     
     # extract the params for momentum
     mom_start = mom_params["start"]
@@ -216,6 +238,7 @@ def test_mlp(
     # allocate symbolic variables for the data
     index = T.lscalar()    # index to a [mini]batch
     epoch = T.scalar()
+    temperature = T.scalar()
     x = T.matrix('x')  # the data is presented as rasterized images
     y = T.ivector('y')  # the labels are presented as 1D vector of
                         # [int] labels
@@ -227,7 +250,7 @@ def test_mlp(
     # construct the MLP class
     classifier = MLP(rng=rng, input=x,
                      layer_sizes=layer_sizes,
-                     dropout_rates=dropout_rates,
+                     temperature=temperature,
                      activations=activations,
                      use_bias=use_bias)
 
@@ -312,7 +335,7 @@ def test_mlp(
     # Compile theano function for training.  This returns the training cost and
     # updates the model parameters.
     output = dropout_cost if dropout else cost
-    train_model = theano.function(inputs=[epoch, index], outputs=output,
+    train_model = theano.function(inputs=[epoch, index, temperature], outputs=output,
             updates=updates,
             givens={
                 x: train_set_x[index * batch_size:(index + 1) * batch_size],
@@ -343,8 +366,9 @@ def test_mlp(
     while epoch_counter < n_epochs:
         # Train this epoch
         epoch_counter = epoch_counter + 1
+        current_temperature = np.float32(10. / epoch_counter)
         for minibatch_index in xrange(n_train_batches):
-            minibatch_avg_cost = train_model(epoch_counter, minibatch_index)
+            minibatch_avg_cost = train_model(epoch_counter, minibatch_index, current_temperature)
 
         # Compute loss on validation set
         validation_losses = [validate_model(i) for i in xrange(n_valid_batches)]
@@ -385,10 +409,8 @@ if __name__ == '__main__':
     squared_filter_length_limit = 15.0
     n_epochs = 3000
     batch_size = 100
-    layer_sizes = [ 28*28, 1200, 1200, 10 ]
+    layer_sizes = [ 28*28, 800, 800, 10 ]
     
-    # dropout rate for each layer
-    dropout_rates = [ 0.2, 0.5, 0.5 ]
     # activation functions for each layer
     # For this demo, we don't need to set the activation functions for the 
     # on top layer, since it is always 10-way Softmax
@@ -408,12 +430,12 @@ if __name__ == '__main__':
     #dataset = 'data/mnist.pkl.gz'
 
     if len(sys.argv) < 2:
-        print "Usage: {0} [dropout|backprop]".format(sys.argv[0])
+        print "Usage: {0} [bobakout|backprop]".format(sys.argv[0])
         exit(1)
 
-    elif sys.argv[1] == "dropout":
+    elif sys.argv[1] == "bobakout":
         dropout = True
-        results_file_name = "results_dropout.txt"
+        results_file_name = "results_bobakout.txt"
 
     elif sys.argv[1] == "backprop":
         dropout = False
@@ -432,7 +454,6 @@ if __name__ == '__main__':
              mom_params=mom_params,
              activations=activations,
              dropout=dropout,
-             dropout_rates=dropout_rates,
              dataset=dataset,
              results_file_name=results_file_name,
              use_bias=False,
